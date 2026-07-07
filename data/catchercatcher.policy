@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Catcher Catcher</vendor>
+  <vendor_url>https://github.com/JimKnopfIoT</vendor_url>
+
+  <action id="catchercatcher.diag">
+    <description>Read baseband diagnostics for IMSI-catcher detection</description>
+    <description xml:lang="de">Baseband-Diagnose zur IMSI-Catcher-Erkennung lesen</description>
+    <message>Authentication is required to read the modem diagnostics interface</message>
+    <message xml:lang="de">Zum Lesen der Modem-Diagnose ist eine Authentifizierung nötig</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/harbour-catchercatcher-diag-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

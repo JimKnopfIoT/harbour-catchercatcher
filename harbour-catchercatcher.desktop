@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Icon=harbour-catchercatcher
+Exec=/usr/bin/invoker --type=silica-qt5 -s -n -d 5 /usr/bin/harbour-catchercatcher
+Name=Catcher Catcher
+Name[de]=Catcher Catcher
+
+[X-Sailjail]
+# Tier 2 needs raw /dev/diag + pkexec, which the sandbox would block.
+Sandboxing=Disabled

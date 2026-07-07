@@ -1,0 +1,799 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# harbour-catchercatcher-diag-helper — Tier 2, runs as root via pkexec.
+#
+# Reads the Qualcomm baseband signalling from /dev/diag (the source SnoopSnitch
+# uses) to see what the cooked ofono layer hides: silent SMS (TP-PID 0x40),
+# cipher downgrade (A5/0), IMSI identity requests, etc.
+#
+# The device-specific ABI was reverse-engineered from the pdx213 kernel source
+# (drivers/char/diag). It WORKS on the Xperia 10 III (verified: ~830 KB/s of
+# type-0x20 log data streams once the masks are set):
+#
+#   SWITCH_LOGGING (ioctl 7): struct diag_logging_mode_param_t, 24 bytes packed
+#       <IIIBBBBii = req_mode, peripheral_mask, pd_mask, mode_param, diag_id,
+#                    pd_val, reserved, int peripheral, int device_mask
+#       req_mode=2 (MEMORY_DEVICE_MODE), peripheral_mask=0xFF (DIAG_CON_ALL),
+#       device_mask=1 (DIAG_MD_LOCAL) — MUST be non-zero or the ioctl EINVALs.
+#   Write a command: [USER_SPACE_DATA_TYPE(0x20):u32] + HDLC(cmd)+crc16.
+#       (no token field for the local/MSM path). Read the response after EACH
+#       command (mandatory: else the next read() blocks / masks don't apply).
+#   Read: open BLOCKING (O_NONBLOCK only yields EAGAIN); bound reads with an
+#       itimer. Data arrives leading-int type 0x20, then [num:u32] then
+#       num x [len:u32][log-packet]. A log packet is DIAG_LOG_F: cmd 0x10, then
+#       at offset 6 the u16 log_code, then an 8-byte timestamp, then payload.
+#
+# stdlib-only (the device has python3 but no pip/pyserial).
+
+import os
+import sys
+import struct
+import fcntl
+import signal
+import time
+import json
+
+DIAG_DEV = "/dev/diag"
+
+DIAG_IOCTL_SWITCH_LOGGING = 7
+MEMORY_DEVICE_MODE = 2
+DIAG_CON_ALL = 0xFF
+DIAG_MD_LOCAL_MASK = 1
+USER_SPACE_DATA_TYPE = 0x00000020
+DIAG_LOG_F = 0x10
+DIAG_LOG_CONFIG_F = 0x73
+LOG_CONFIG_GET_RANGE = 1
+LOG_CONFIG_SET_MASK = 3
+
+# Log codes that carry what we care about (equip_id = code >> 12):
+#   LTE  RRC OTA        0xB0C0  (security-mode -> A5/0 / EEA0 detection)
+#   LTE  NAS EMM OTA    0xB0E2 / 0xB0E3  (carries CS/IMS SMS transport, identity req)
+#   LTE  NAS ESM OTA    0xB0E0 / 0xB0E1
+#   GSM  RR signalling  0x512F  (DTAP incl. SMS CP/RP, cipher mode command)
+#   WCDMA RRC OTA       0x412F
+INTERESTING = {
+    0xB0C0: "LTE RRC OTA",
+    0xB0E0: "LTE NAS ESM OTA (in)",
+    0xB0E1: "LTE NAS ESM OTA (out)",
+    0xB0E2: "LTE NAS EMM OTA (in)",
+    0xB0E3: "LTE NAS EMM OTA (out)",
+    0x512F: "GSM RR signalling (DTAP/SMS)",
+    0x412F: "WCDMA RRC OTA",
+}
+
+
+# --- HDLC + CRC ------------------------------------------------------------
+_CRC = None
+
+
+def _crc_table():
+    global _CRC
+    if _CRC is None:
+        t = []
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ 0x8408 if (c & 1) else (c >> 1)
+            t.append(c & 0xFFFF)
+        _CRC = t
+    return _CRC
+
+
+def crc16(d):
+    t = _crc_table()
+    crc = 0xFFFF
+    for b in d:
+        crc = (crc >> 8) ^ t[(crc ^ b) & 0xFF]
+    return (~crc) & 0xFFFF
+
+
+def hdlc(payload):
+    raw = bytes(payload) + struct.pack("<H", crc16(payload))
+    o = bytearray()
+    for b in raw:
+        if b in (0x7E, 0x7D):
+            o += bytes([0x7D, b ^ 0x20])
+        else:
+            o.append(b)
+    o.append(0x7E)
+    return bytes(o)
+
+
+def dehdlc(seg):
+    o = bytearray()
+    esc = False
+    for b in seg:
+        if esc:
+            o.append(b ^ 0x20); esc = False
+        elif b == 0x7D:
+            esc = True
+        elif b == 0x7E:
+            break
+        else:
+            o.append(b)
+    return bytes(o)
+
+
+# --- timed blocking I/O ----------------------------------------------------
+class _Timeout(Exception):
+    pass
+
+
+def _alarm(sig, frm):
+    raise _Timeout()
+
+
+def diag_read(fd, secs=0.4, n=1 << 18):
+    old = signal.signal(signal.SIGALRM, _alarm)
+    signal.setitimer(signal.ITIMER_REAL, secs)
+    try:
+        return os.read(fd, n)
+    except (_Timeout, OSError):
+        return b""
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def open_diag():
+    return os.open(DIAG_DEV, os.O_RDWR)      # BLOCKING on purpose
+
+
+def switch_memory(fd):
+    buf = struct.pack("<IIIBBBBii", MEMORY_DEVICE_MODE, DIAG_CON_ALL, 0,
+                      0, 0, 0, 0, 0, DIAG_MD_LOCAL_MASK)
+    try:
+        fcntl.ioctl(fd, DIAG_IOCTL_SWITCH_LOGGING, buf)
+        return True
+    except OSError as e:
+        # EINVAL usually means we're already in memory mode from a prior run
+        sys.stderr.write("[!] SWITCH_LOGGING: errno=%d (%s) — continuing\n"
+                         % (e.errno, e.strerror))
+        return False
+
+
+def cmd(fd, payload):
+    """Send a DIAG command, return the de-HDLC'd response body (or b'')."""
+    os.write(fd, struct.pack("<I", USER_SPACE_DATA_TYPE) + hdlc(payload))
+    d = diag_read(fd, 0.5)
+    if len(d) >= 4 and struct.unpack_from("<I", d, 0)[0] == USER_SPACE_DATA_TYPE \
+            and 0x7E in d[4:]:
+        return dehdlc(d[4:])
+    return d
+
+
+def get_ranges(fd):
+    r = cmd(fd, struct.pack("<BBBBI", DIAG_LOG_CONFIG_F, 0, 0, 0, LOG_CONFIG_GET_RANGE))
+    # response body: [num:u32][len:u32][0x73][op:u32][status:u32][16 x u32 ranges]
+    try:
+        return list(struct.unpack_from("<16I", r, 20))
+    except struct.error:
+        return [0] * 16
+
+
+def set_masks(fd, ranges):
+    enabled = []
+    for eq, ni in enumerate(ranges):
+        if ni <= 0:
+            continue
+        mask = b"\xff" * ((ni + 7) // 8)
+        cmd(fd, struct.pack("<BBBBII", DIAG_LOG_CONFIG_F, 0, 0, 0,
+                            LOG_CONFIG_SET_MASK, eq) + struct.pack("<I", ni) + mask)
+        enabled.append((eq, ni))
+    return enabled
+
+
+def iter_log_packets(chunk):
+    """Yield log packets from a type-0x20 read chunk."""
+    if len(chunk) < 8 or struct.unpack_from("<I", chunk, 0)[0] != USER_SPACE_DATA_TYPE:
+        return
+    num = struct.unpack_from("<I", chunk, 4)[0]
+    off = 8
+    for _ in range(num):
+        if off + 4 > len(chunk):
+            return
+        ln = struct.unpack_from("<I", chunk, off)[0]
+        off += 4
+        if ln < 8 or off + ln > len(chunk):
+            return
+        yield chunk[off:off + ln]
+        off += ln
+
+
+def log_code(pkt):
+    return struct.unpack_from("<H", pkt, 6)[0] if len(pkt) >= 8 else 0
+
+
+def start_capture(fd):
+    switch_memory(fd)
+    for _ in range(3):
+        diag_read(fd, 0.2)          # drain the initial mask dumps
+    ranges = get_ranges(fd)
+    enabled = set_masks(fd, ranges)
+    return ranges, enabled
+
+
+# --- subcommands -----------------------------------------------------------
+def cmd_logtest(seconds):
+    fd = open_diag()
+    ranges, enabled = start_capture(fd)
+    sys.stdout.write("[*] equip ranges: %s\n"
+                     % {hex(i): ranges[i] for i in range(16) if ranges[i]})
+    sys.stdout.write("[*] masks enabled for %d equipment ids\n" % len(enabled))
+    sys.stdout.flush()
+
+    codes = {}
+    interesting = {}
+    npkt = 0
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        d = diag_read(fd, 0.4)
+        if not d:
+            continue
+        for pkt in iter_log_packets(d):
+            npkt += 1
+            c = log_code(pkt)
+            codes[c] = codes.get(c, 0) + 1
+            if c in INTERESTING:
+                interesting[c] = interesting.get(c, 0) + 1
+    os.close(fd)
+
+    sys.stdout.write("[=] %d log packets, %d distinct codes in %ds\n"
+                     % (npkt, len(codes), seconds))
+    for c, n in sorted(codes.items(), key=lambda kv: -kv[1])[:30]:
+        tag = ("  <-- " + INTERESTING[c]) if c in INTERESTING else ""
+        sys.stdout.write("   0x%04X : %d%s\n" % (c, n, tag))
+    if interesting:
+        sys.stdout.write("[!] interesting codes seen: %s\n"
+                         % {hex(c): n for c, n in interesting.items()})
+    return 0
+
+
+# high-frequency measurement/housekeeping codes we ignore while hunting an SMS
+NOISE = {0x0000, 0x192A, 0x19DA, 0x19C9, 0x18C3, 0xB12B, 0xB143, 0x19ED,
+         0x1C64, 0x1874, 0x18E8, 0x19FE, 0x1A12, 0x1933, 0x1900, 0x19CD,
+         0x18AB, 0x18E1, 0x1CB9, 0x1C98, 0x19B5, 0x1994}
+
+
+def cmd_smshunt(seconds, outpath):
+    """Capture every non-noise log packet to a file so we can find a real SMS
+    (send yourself one during the window) and locate its TP-PID/TP-DCS."""
+    fd = open_diag()
+    ranges, enabled = start_capture(fd)
+    sys.stdout.write("[*] hunting %ds — SEND YOURSELF AN SMS NOW\n" % seconds)
+    sys.stdout.flush()
+    saved = 0
+    seen = {}
+    with open(outpath, "w") as out:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            d = diag_read(fd, 0.4)
+            if not d:
+                continue
+            for pkt in iter_log_packets(d):
+                c = log_code(pkt)
+                if c in NOISE:
+                    continue
+                seen[c] = seen.get(c, 0) + 1
+                out.write("%04X %s\n" % (c, pkt.hex()))
+                saved += 1
+    os.close(fd)
+    sys.stdout.write("[=] saved %d packets to %s\n" % (saved, outpath))
+    sys.stdout.write("[*] non-noise codes: %s\n"
+                     % {hex(c): n for c, n in sorted(seen.items(), key=lambda kv: -kv[1])})
+    return 0
+
+
+def parse_all_packets(fd, seconds):
+    """Yield (code, packet) for every log packet during the window (framing:
+    chunk [0x20][num][total_len], packets [10 00][len@2]..., size = len+7)."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        ch = diag_read(fd, 0.4)
+        if len(ch) < 12 or struct.unpack_from("<I", ch, 0)[0] != USER_SPACE_DATA_TYPE:
+            continue
+        total = struct.unpack_from("<I", ch, 8)[0]
+        p = 12
+        end = min(12 + total, len(ch))
+        while p + 8 <= end:
+            if ch[p] != 0x10:
+                break
+            ln = struct.unpack_from("<H", ch, p + 2)[0]
+            code = struct.unpack_from("<H", ch, p + 6)[0]
+            yield code, ch[p:p + ln + 7]
+            p += ln + 7
+
+
+# GSM RR message types (subset we care about)
+GSM_RR_CIPHER_MODE_CMD = 0x35
+GSM_MM_IDENTITY_REQUEST = 0x18
+
+
+def cmd_watch(seconds):
+    """Watch for IMSI-catcher fingerprints in plaintext control-plane messages:
+    GSM RR Cipher Mode Command (A5/0 downgrade) and MM Identity Request (IMSI)."""
+    fd = open_diag()
+    ranges, enabled = start_capture(fd)
+    sys.stdout.write("[*] watching %ds — trigger a Location Update (toggle "
+                     "flight mode) to see cipher-mode / identity messages\n" % seconds)
+    sys.stdout.flush()
+    rr_types = {}
+    alerts = 0
+    for code, pk in parse_all_packets(fd, seconds):
+        if code != 0x512F:
+            continue
+        body = pk[16:]
+        if len(body) < 3:
+            continue
+        chan_dir, mtype, mlen = body[0], body[1], body[2]
+        l3 = body[3:3 + mlen]
+        rr_types[mtype] = rr_types.get(mtype, 0) + 1
+
+        # RR Cipher Mode Command -> cipher mode setting octet (algorithm)
+        if mtype == GSM_RR_CIPHER_MODE_CMD and len(l3) >= 1:
+            setting = l3[-1] if len(l3) >= 1 else 0
+            # in the L3, the cipher mode setting IE: bit0 SC (0=no cipher),
+            # bits1-3 = algorithm (0=A5/1). Scan L3 for the setting octet.
+            sc = None
+            for b in l3:
+                # heuristic: the setting octet has high nibble 0 and is small
+                pass
+            sys.stdout.write("[!!!] RR CIPHER MODE COMMAND seen  L3=%s\n" % l3.hex())
+            sys.stdout.flush()
+            alerts += 1
+
+        # MM Identity Request (DTAP): PD=0x05 (MM), type=0x18
+        if len(l3) >= 2 and (l3[0] & 0x0F) == 0x05 and l3[1] == GSM_MM_IDENTITY_REQUEST:
+            idtype = l3[2] & 0x07 if len(l3) >= 3 else 0
+            sys.stdout.write("[!!!] MM IDENTITY REQUEST  id_type=%d %s\n"
+                             % (idtype, "(IMSI!)" if idtype == 1 else ""))
+            sys.stdout.flush()
+            alerts += 1
+
+    os.close(fd)
+    sys.stdout.write("[=] done. RR message types seen: %s\n"
+                     % {hex(k): v for k, v in sorted(rr_types.items())})
+    sys.stdout.write("[=] %d cipher/identity alerts\n" % alerts)
+    return 0
+
+
+# --- Stage D: long-running machine-readable service for the app ------------
+# The app launches this via pkexec (polkit action catchercatcher.diag)
+# and reads one JSON object per line from stdout:
+#   {"ev":"ready"}                          -> stream up, masks applied
+#   {"ev":"alarm", "type":..,"severity":.., "text":.., ...}  -> a fingerprint
+#   {"ev":"error","msg":..}                 -> fatal init problem
+#   {"ev":"bye"}                            -> clean exit
+# It runs until the parent (pkexec/app) goes away (getppid changes), so the app
+# stops it simply by terminating the pkexec child — no signal plumbing needed.
+
+def _emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _rr_alarm(mtype, l3):
+    """Return an alarm dict for an IMSI-catcher fingerprint in a GSM RR/DTAP L3
+    message, or None. Fingerprints (plaintext, sent before ciphering starts):
+      - RR Cipher Mode Command (MT 0x35) with SC=0  -> A5/0 downgrade
+      - MM Identity Request (PD 0x05, MT 0x18)      -> IMSI/IMEI fishing
+    """
+    # RR Cipher Mode Command: L3 = [PD=0x06][MT=0x35][cipher mode setting]
+    if mtype == GSM_RR_CIPHER_MODE_CMD and len(l3) >= 3:
+        setting = l3[2]
+        sc = setting & 0x01            # 0 = no ciphering (A5/0)
+        algo = (setting >> 1) & 0x07   # 0 = A5/1, 1 = A5/2, ...
+        if sc == 0:
+            return {"ev": "alarm", "kind": "cipher",
+                    "type": "Cipher-Downgrade A5/0", "severity": 3,
+                    "from": "Netz", "dcs": "A5/0 (keine Verschlüsselung)",
+                    "text": "RR Cipher Mode Command erzwingt A5/0 — Funk wird "
+                            "unverschlüsselt. Typisches IMSI-Catcher-Verhalten.",
+                    "l3": l3.hex()}
+        return None
+
+    # MM Identity Request (DTAP): L3 = [PD=0x05][MT=0x18][id type]
+    if len(l3) >= 2 and (l3[0] & 0x0F) == 0x05 and l3[1] == GSM_MM_IDENTITY_REQUEST:
+        idtype = (l3[2] & 0x07) if len(l3) >= 3 else 0
+        names = {1: "IMSI", 2: "IMEI", 3: "IMEISV", 4: "TMSI"}
+        name = names.get(idtype, "unbekannt")
+        sev = 3 if idtype in (1, 2, 3) else 2
+        return {"ev": "alarm", "kind": "identity",
+                "type": "Identity Request (%s)" % name, "severity": sev,
+                "from": "Netz",
+                "text": "Netz fordert %s an (Identity Request). Bei gültiger "
+                        "TMSI unnötig — Hinweis auf IMSI-/IMEI-Catcher." % name,
+                "l3": l3.hex()}
+    return None
+
+
+# --- silent-SMS detector (Tier 2) ------------------------------------------
+# A silent "ping" SMS is invisible to ofono (verified) and, on this modem, shows
+# only on 2G in the baseband SMS logs: CS via 0x512F, GPRS/EDGE via 0x7001/0x713A.
+# We scan a packet body for a
+# self-consistent SMS-DELIVER TPDU and flag the silent kinds: TP-PID 0x40 (Type-0)
+# or a TP-UDHI application-port UDH (IEI 0x04/0x05 — e.g. the port-9200 ITDS ping)
+# with no visible text. On LTE/NR the modem emits no OTA SMS logs -> not visible.
+SMS_CODES = (0x512F, 0x7001, 0x713A)
+_sms_seen = {}     # tpdu-hex -> last emit time (dedup: one SMS logs many times)
+
+
+def _decode_addr(b, off, oal):
+    """Decode a GSM TP-address (semi-octet BCD, swapped) into a *dialable* number
+    string, or None if it isn't one. Real MSISDNs use only digits 0-9 plus a single
+    trailing 0xF filler on an odd length. Rejecting a-f in significant positions is
+    what kills the false positives (e.g. call-control DTAP bytes decoding to '+a3…'
+    or '+cb' during a voice call) — those are never valid sender numbers."""
+    noct = (oal + 1) // 2
+    digits = []
+    for x in b[off:off + noct]:
+        digits.append(x & 0x0F)
+        digits.append(x >> 4)
+    if oal % 2 == 1:                      # odd length -> last nibble must be filler
+        if digits[-1] != 0x0F:
+            return None
+        digits = digits[:-1]
+    if len(digits) != oal:
+        return None
+    s = ""
+    for d in digits:
+        if d > 9:                         # only 0-9; no *,#,a-f garbage
+            return None
+        s += str(d)
+    return s
+
+
+def _parse_deliver(b, i):
+    """Parse a strongly-validated SMS-DELIVER TPDU at b[i:] -> (tpdu, fields) or None.
+    MTI + type-of-address whitelist + dialable-address + BCD-*calendar* timestamp +
+    UDL-fit checks make a false match at a random offset (e.g. inside call-control
+    signalling) practically impossible."""
+    n = len(b)
+    if i + 13 > n:
+        return None
+    fo = b[i]
+    if (fo & 0x03) != 0x00:               # MTI must be 00 = SMS-DELIVER
+        return None
+    oal = b[i + 1]
+    if oal < 6 or oal > 20:               # plausible MSISDN length (>= 6 digits)
+        return None
+    toa = b[i + 2]                        # TP-OA type-of-address octet
+    ton = (toa >> 4) & 0x07
+    npi = toa & 0x0F
+    if not (toa & 0x80):                  # bit7 always set
+        return None
+    if ton not in (0, 1, 2):             # unknown / international / national only
+        return None
+    if npi not in (0, 1):                # unknown / ISDN-E.164 only
+        return None
+    noct = (oal + 1) // 2
+    oa = _decode_addr(b, i + 3, oal)
+    if oa is None:
+        return None
+    k = i + 3 + noct
+    if k + 10 > n:
+        return None
+    pid, dcs = b[k], b[k + 1]
+    scts = b[k + 2:k + 9]                 # TP-SCTS: 7 BCD octets (swapped nibbles)
+    for x in scts:
+        if (x & 0x0F) > 9 or (x >> 4) > 9:
+            return None
+    def _bcd(x):
+        return (x & 0x0F) * 10 + (x >> 4)
+    mon, day = _bcd(scts[1]), _bcd(scts[2])
+    hh, mm, ss = _bcd(scts[3]), _bcd(scts[4]), _bcd(scts[5])
+    if not (1 <= mon <= 12 and 1 <= day <= 31 and hh <= 23 and mm <= 59 and ss <= 59):
+        return None                      # must be a real calendar date/time
+    udl = b[k + 9]
+    ud_start = k + 10
+    alpha = (dcs >> 2) & 0x03 if (dcs & 0xC0) == 0 else 1   # 0=7bit else octets
+    ud_oct = (udl * 7 + 7) // 8 if alpha == 0 else udl
+    if ud_oct > 160 or ud_start + ud_oct > n:
+        return None
+    fields = {"fo": fo, "oa": oa,
+              "pid": pid, "dcs": dcs, "udl": udl, "ud": b[ud_start:ud_start + ud_oct]}
+    return b[i:ud_start + ud_oct], fields
+
+
+def _silent_kind(f):
+    """('Type-0'|'Port-Daten-SMS', extra) if the DELIVER is silent/stealth, else None."""
+    if f["pid"] == 0x40:                  # Short Message Type 0
+        return "Type-0", ""
+    if (f["fo"] & 0x40) and f["ud"]:      # TP-UDHI -> walk the UDH
+        ud = f["ud"]
+        udh = ud[1:1 + ud[0]]
+        j = 0
+        while j + 1 < len(udh):
+            iei, iedl = udh[j], udh[j + 1]
+            val = udh[j + 2:j + 2 + iedl]
+            if iei in (0x04, 0x05):       # application-port addressing (silent data SMS)
+                port = int.from_bytes(val[:2], "big") if iei == 0x05 else (val[0] if val else 0)
+                return "Port-Daten-SMS", " (Port %d)" % port
+            j += 2 + iedl
+    return None
+
+
+def _sms_alarm_from_packet(pk):
+    b = pk[16:]                           # skip the 16-byte diag log header
+    i, lim = 0, len(pk) - 16 - 12
+    while i < lim:
+        r = _parse_deliver(b, i)
+        if not r:
+            i += 1
+            continue
+        tpdu, f = r
+        sk = _silent_kind(f)
+        if not sk:
+            i += len(tpdu)                # a normal (visible) SMS -> skip it
+            continue
+        key = tpdu.hex()
+        now = time.time()
+        if now - _sms_seen.get(key, 0) < 30:     # same SMS logs repeatedly
+            return None
+        _sms_seen[key] = now
+        if len(_sms_seen) > 64:
+            for kk in [k for k, t in _sms_seen.items() if now - t > 60]:
+                _sms_seen.pop(kk, None)
+        label, extra = sk
+        oa = f["oa"] or "?"
+        return {"ev": "alarm", "kind": "silent-sms",
+                "type": "Unsichtbare SMS (%s)%s" % (label, extra),
+                "severity": 2, "from": "+" + oa,
+                "dcs": "still (keine Anzeige)",
+                "text": "Unsichtbare SMS empfangen (stiller Ping, %s) von +%s — "
+                        "mögliche Ortung/Erreichbarkeitsprüfung." % (label, oa),
+                "l3": tpdu.hex()}
+    return None
+
+
+def _pid_alive(pid):
+    """True if `pid` still exists (any owner). We run as root, so kill(pid,0)
+    reaches processes of any user; ProcessLookupError => gone."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists but not signalable by us -> still alive
+
+
+def cmd_service(watch_pid=None):
+    try:
+        fd = open_diag()
+    except OSError as e:
+        _emit({"ev": "error", "msg": "open /dev/diag: %s" % e.strerror})
+        return 1
+    try:
+        start_capture(fd)
+    except Exception as e:                       # noqa: BLE001 (report + bail)
+        _emit({"ev": "error", "msg": "capture init: %s" % e})
+        os.close(fd)
+        return 1
+
+    # Explicit-stop sentinel: the app runs as defaultuser and CANNOT signal this
+    # root process (kill -> EPERM), so "Tier 2 stop" can't terminate pkexec.
+    # Instead the app touches this file (both can access /tmp); we poll for it.
+    stop_path = ("/tmp/harbour-catchercatcher-diag-stop.%d" % watch_pid
+                 if watch_pid is not None else None)
+
+    _emit({"ev": "ready"})
+    ppid0 = os.getppid()
+    last_hb = time.time()
+    while True:
+        # (0a) explicit stop request from the app (sentinel file). /tmp is
+        # world-writable, so only a real regular file counts: a planted symlink
+        # is removed and ignored (unlink removes the link itself, not its target).
+        if stop_path and os.path.lexists(stop_path):
+            is_link = os.path.islink(stop_path)
+            try:
+                os.unlink(stop_path)
+            except OSError:
+                pass
+            if not is_link:
+                break
+        # (0b) app gone (swipe-close/crash) -> exit; robust regardless of the
+        # pkexec-in-between / getppid / pipe semantics.
+        if watch_pid is not None and not _pid_alive(watch_pid):
+            break
+        # (1) direct parent (pkexec) gone -> stopped via terminate(); exit.
+        if os.getppid() != ppid0:
+            break
+        # (2) heartbeat: if the app closed unexpectedly (swipe/crash), pkexec is
+        # reparented to init but stays alive, so getppid() would NOT change and a
+        # root reader could linger forever on /dev/diag. Writing a heartbeat to
+        # stdout fails (BrokenPipe) once the app-side reader is gone -> exit.
+        now = time.time()
+        if now - last_hb >= 4:
+            last_hb = now
+            try:
+                _emit({"ev": "hb"})
+            except (BrokenPipeError, OSError):
+                break
+        ch = diag_read(fd, 0.4)
+        if len(ch) < 12 or struct.unpack_from("<I", ch, 0)[0] != USER_SPACE_DATA_TYPE:
+            continue
+        # Iterate the log packets in the chunk. RESYNC on any misalignment (skip
+        # a byte) instead of breaking — one odd/foreign packet must not hide the
+        # rest of the blob (that was why 0x7001 SMS packets were missed live). The
+        # duplicate length field (offsets 2 and 4 are identical) validates a frame.
+        p = 12
+        end = len(ch)
+        while p + 8 <= end:
+            if ch[p] != 0x10 or ch[p + 1] != 0x00:
+                p += 1
+                continue
+            ln = struct.unpack_from("<H", ch, p + 2)[0]
+            if ln <= 0 or ln != struct.unpack_from("<H", ch, p + 4)[0] or p + ln + 7 > end:
+                p += 1
+                continue
+            code = struct.unpack_from("<H", ch, p + 6)[0]
+            pk = ch[p:p + ln + 7]
+            p += ln + 7
+
+            # Silent-SMS (2G): CS via 0x512F, GPRS/EDGE via 0x7001/0x713A.
+            # 0x512F also carries cipher/identity, so fall through for it.
+            if code in SMS_CODES:
+                sa = _sms_alarm_from_packet(pk)
+                if sa:
+                    _emit(sa)
+                if code != 0x512F:
+                    continue
+
+            # GSM RR (2G) — verified detector: A5/0 downgrade + Identity Request
+            if code == 0x512F:
+                body = pk[16:]
+                if len(body) < 3:
+                    continue
+                mtype, mlen = body[1], body[2]
+                l3 = body[3:3 + mlen]
+                alarm = _rr_alarm(mtype, l3)
+                if alarm:
+                    _emit(alarm)
+                continue
+
+            # LTE PDCP cipher (EEA0 downgrade). Gated to the PDCP log-code region
+            # so we don't run the parser on the ML1 measurement flood. Fail-safe:
+            # only alarms on algo 0x07 (NONE/EEA0); the normal AES=0x03 is silent.
+            # Layout verified from SCAT; the exact device log code + a live EEA0
+            # still want confirmation via `ltehunt` (needs cellular data active).
+            if 0xB0A0 <= code <= 0xB0BF:
+                cip = parse_pdcp_cipher(pk)
+                if cip is not None and (cip[0] == 0x07 or cip[1] == 0x07):
+                    _emit({"ev": "alarm", "kind": "cipher",
+                           "type": "LTE Cipher-Downgrade EEA0", "severity": 3,
+                           "from": "Netz", "dcs": "EEA0 (keine Verschlüsselung)",
+                           "text": "LTE PDCP meldet EEA0/NONE — LTE-Funk "
+                                   "unverschlüsselt. Verdacht auf IMSI-Catcher.",
+                           "l3": "srb=0x%02x drb=0x%02x" % (cip[0], cip[1])})
+    os.close(fd)
+    try:
+        _emit({"ev": "bye"})   # may fail if we broke out on a dead pipe
+    except (BrokenPipeError, OSError):
+        pass
+    return 0
+
+
+# --- LTE detector groundwork (empirical verification on-device) ------------
+# The PDCP DL/UL Ciphered-PDU log (SCAT: subpkt id 0xC3) carries the active
+# ciphering algorithm directly: 0x07 = NONE = EEA0 (downgrade), 0x03 = AES.
+# The subpacket layout (verified from SCAT diagltelogparser.parse_lte_pdcp_subpkt_v1):
+#   log-packet payload (after the 16-byte log header):
+#     [0]=grp version(=1) [1]=n_subpackets [2:4]=reserved, then subpackets:
+#     subpkt hdr <BBH> = id, version, size ; then `size` bytes of subpkt body
+#   for id 0xC3, version in (0x18, 0x1a):
+#     body[0:16]=ck_srb  body[16:32]=ck_drb
+#     body[32]=cipher_algo_srb  body[33]=cipher_algo_drb  body[34:36]=num_pdus
+# This shape is distinctive enough to recognise the cipher log by content, so we
+# can find its log CODE empirically at the same time as verifying the parser.
+
+def parse_pdcp_cipher(pkt):
+    """If `pkt` is an LTE PDCP DL/UL Ciphered-PDU log, return (algo_srb, algo_drb),
+    else None. Works by content (subpkt id 0xC3), independent of the log code."""
+    body = pkt[16:]
+    if len(body) < 4 or body[0] != 1:
+        return None
+    n_sub = body[1]
+    pos = 4
+    for _ in range(n_sub):
+        if pos + 4 > len(body):
+            return None
+        sid, sver, ssize = struct.unpack_from("<BBH", body, pos)
+        sbody = body[pos + 4:pos + 4 + ssize]
+        pos += 4 + ssize
+        if sid == 0xC3 and sver in (0x18, 0x1a) and len(sbody) >= 36:
+            algo_srb, algo_drb, _num = struct.unpack_from("<BBH", sbody, 32)
+            return algo_srb, algo_drb
+    return None
+
+
+_ALGO = {0x07: "EEA0/NONE", 0x03: "AES(EEA2)", 0x01: "SNOW3G(EEA1)", 0x00: "?"}
+
+
+def cmd_ltehunt(seconds, outpath):
+    """Capture LTE (equip 0xB) packets to a file and, live, tally LTE log codes
+    and decode any PDCP cipher log found (reporting the ciphering algorithm).
+    Run on LTE with some data activity so the PDCP cipher logs flow."""
+    fd = open_diag()
+    start_capture(fd)
+    sys.stdout.write("[*] LTE-hunt %ds — verursache etwas Datenverkehr (Browser/Ping)\n"
+                     % seconds)
+    sys.stdout.flush()
+    codes = {}
+    cipher_seen = {}
+    saved = 0
+    with open(outpath, "w") as out:
+        for code, pk in parse_all_packets(fd, seconds):
+            if (code >> 12) != 0xB:          # equip 0xB = LTE
+                continue
+            codes[code] = codes.get(code, 0) + 1
+            out.write("%04X %s\n" % (code, pk.hex()))
+            saved += 1
+            cip = parse_pdcp_cipher(pk)
+            if cip is not None:
+                key = (code, cip)
+                if key not in cipher_seen:
+                    cipher_seen[key] = 0
+                    sys.stdout.write("[cipher] code 0x%04X  SRB=%s  DRB=%s\n"
+                                     % (code, _ALGO.get(cip[0], hex(cip[0])),
+                                        _ALGO.get(cip[1], hex(cip[1]))))
+                    sys.stdout.flush()
+                cipher_seen[key] += 1
+    os.close(fd)
+    sys.stdout.write("[=] %d LTE packets saved to %s\n" % (saved, outpath))
+    sys.stdout.write("[=] LTE codes: %s\n"
+                     % {hex(c): n for c, n in sorted(codes.items(), key=lambda kv: -kv[1])[:25]})
+    if cipher_seen:
+        sys.stdout.write("[=] PDCP cipher observations: %s\n"
+                         % {("0x%04X" % c, _ALGO.get(a[0], hex(a[0]))): n
+                            for (c, a), n in cipher_seen.items()})
+    else:
+        sys.stdout.write("[=] no PDCP cipher log seen (need LTE data activity)\n")
+    return 0
+
+
+def cmd_rawcap(seconds, outpath):
+    """Save the RAW type-0x20 log-data chunks to a binary file (each prefixed
+    with a u32 length) — no packet parsing, so we can dissect offline correctly."""
+    fd = open_diag()
+    start_capture(fd)
+    sys.stdout.write("[*] raw-capturing %ds — SEND YOURSELF AN SMS NOW\n" % seconds)
+    sys.stdout.flush()
+    total = 0
+    with open(outpath, "wb") as out:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            d = diag_read(fd, 0.4)
+            if len(d) >= 8 and struct.unpack_from("<I", d, 0)[0] == USER_SPACE_DATA_TYPE:
+                out.write(struct.pack("<I", len(d)))
+                out.write(d)
+                total += len(d)
+    os.close(fd)
+    sys.stdout.write("[=] %d raw bytes to %s\n" % (total, outpath))
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[1] == "logtest":
+        return cmd_logtest(int(argv[2]))
+    if len(argv) >= 3 and argv[1] == "rawcap":
+        return cmd_rawcap(int(argv[2]), argv[3] if len(argv) > 3 else "/tmp/ccraw.bin")
+    if len(argv) >= 3 and argv[1] == "watch":
+        return cmd_watch(int(argv[2]))
+    if len(argv) >= 3 and argv[1] == "smshunt":
+        return cmd_smshunt(int(argv[2]), argv[3] if len(argv) > 3 else "/tmp/ccsms.txt")
+    if len(argv) >= 2 and argv[1] == "service":
+        wp = int(argv[2]) if len(argv) >= 3 and argv[2].isdigit() else None
+        return cmd_service(wp)
+    if len(argv) >= 3 and argv[1] == "ltehunt":
+        return cmd_ltehunt(int(argv[2]), argv[3] if len(argv) > 3 else "/tmp/cclte.txt")
+    sys.stderr.write("usage: harbour-catchercatcher-diag-helper logtest SECONDS\n"
+                     "       harbour-catchercatcher-diag-helper smshunt SECONDS [OUT]\n"
+                     "       harbour-catchercatcher-diag-helper watch SECONDS\n"
+                     "       harbour-catchercatcher-diag-helper service   (JSON, for the app)\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
