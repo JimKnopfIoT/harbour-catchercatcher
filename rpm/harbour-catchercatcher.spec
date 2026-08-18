@@ -1,11 +1,11 @@
 Name:       harbour-catchercatcher
 Summary:    Detect IMSI-catcher fingerprints from cell + baseband signals
-Version:    0.1.0
-Release:    57
+Version:    0.1.1
+Release:    1
 %define _buildhost reproducible-builder
 Group:      Qt/Qt
 License:    GPLv3+
-URL:        https://github.com/JimKnopfIoT
+URL:        https://github.com/JimKnopfIoT/harbour-catchercatcher
 Source0:    %{name}-%{version}.tar.bz2
 
 Requires:   sailfishsilica-qt5 >= 0.10.9
@@ -55,3 +55,9 @@ desktop-file-install --delete-original \
 %{_datadir}/applications/%{name}.desktop
 %{_datadir}/icons/hicolor/*/apps/%{name}.png
 %{_datadir}/polkit-1/actions/catchercatcher.policy
+
+%changelog
+* Tue Aug 18 2026 harbour-catchercatcher contributors 0.1.1-1
+- Release build with the project's repository in the package header (the 0.1.0
+  build named the account, not the repo) and the first version offered on
+  OpenRepos. No change to the app itself.

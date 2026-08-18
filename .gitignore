@@ -28,3 +28,4 @@ deepseek-review.md
 # Local data exports
 scripts/masten_de.csv*
 *.log
+/harbour-catchercatcher
