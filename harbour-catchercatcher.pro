@@ -15,14 +15,16 @@ SOURCES += \
     src/osmfetch.cpp \
     src/ocidlookup.cpp \
     src/bnetzalookup.cpp \
-    src/sensorreader.cpp
+    src/sensorreader.cpp \
+    src/mtkdiag.cpp
 
 HEADERS += \
     src/cellmonitor.h \
     src/osmfetch.h \
     src/ocidlookup.h \
     src/bnetzalookup.h \
-    src/sensorreader.h
+    src/sensorreader.h \
+    src/mtkdiag.h
 
 SAILFISHAPP_ICONS = 86x86 108x108 128x128 172x172
 
@@ -35,6 +37,11 @@ gui.path = /usr/share/$${TARGET}
 # Shipped but only started on demand from the app; Tier 1 works without it.
 helper.files = data/harbour-catchercatcher-diag-helper
 helper.path = /usr/bin
+
+# MediaTek collector (CCCI/DHL via emdlogger) — the counterpart of the Qualcomm
+# helper for MT6858 devices (Jolla Phone). Same NDJSON protocol; picked at runtime.
+mtkhelper.files = data/harbour-catchercatcher-mtk-helper
+mtkhelper.path = /usr/bin
 
 policy.files = data/catchercatcher.policy
 policy.path = /usr/share/polkit-1/actions
@@ -56,7 +63,7 @@ ICONPATH = /usr/share/icons/hicolor
 172.png.path = $${ICONPATH}/172x172/apps/
 172.png.files += icons/172x172/harbour-catchercatcher.png
 
-INSTALLS += gui helper policy desktopfile \
+INSTALLS += gui helper mtkhelper policy desktopfile \
             86.png 108.png 128.png 172.png
 
 DISTFILES += \
@@ -67,6 +74,7 @@ DISTFILES += \
     qml/pages/AboutPage.qml \
     qml/cover/CoverPage.qml \
     data/harbour-catchercatcher-diag-helper \
+    data/harbour-catchercatcher-mtk-helper \
     data/catchercatcher.policy \
     harbour-catchercatcher.desktop \
     rpm/harbour-catchercatcher.spec

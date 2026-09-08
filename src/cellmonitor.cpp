@@ -862,9 +862,29 @@ static QString diagStopSentinel()
             .arg(QCoreApplication::applicationPid());
 }
 
+// Which root collector fits this baseband. Qualcomm reads /dev/diag; MediaTek has
+// no /dev/diag and needs the DHL collector (CCCI/DHL via emdlogger). Both speak
+// the same NDJSON protocol, take "service <pid>", and honour the same stop
+// sentinel, so the rest of the Tier 2 code is platform-agnostic. /dev/diag wins
+// if somehow both exist (it is the path Tier 2 was first built on).
+static QString tier2HelperPath()
+{
+    if (QFileInfo::exists(QStringLiteral("/dev/diag")))
+        return QStringLiteral("/usr/bin/harbour-catchercatcher-diag-helper");
+    if (QFileInfo::exists(QStringLiteral("/dev/ccci_ccb_dhl")))
+        return QStringLiteral("/usr/bin/harbour-catchercatcher-mtk-helper");
+    return QString();
+}
+
 void CellMonitor::startTier2()
 {
     if (m_diagProc) return;   // already running / starting
+    const QString helper = tier2HelperPath();
+    if (helper.isEmpty()) {
+        addEvent(2, tr("Tier 2 nicht verfügbar: kein bekannter Baseband-"
+                       "Diagnosekanal (weder Qualcomm /dev/diag noch MediaTek DHL)."));
+        return;
+    }
     m_diagBuf.clear();
     QFile::remove(diagStopSentinel());   // clear any stale stop request
     m_diagProc = new QProcess(this);
@@ -880,7 +900,7 @@ void CellMonitor::startTier2()
     // (swipe-close/crash) even while the orphaned pkexec lingers.
     m_diagProc->start(QStringLiteral("pkexec"),
                       QStringList{
-                          QStringLiteral("/usr/bin/harbour-catchercatcher-diag-helper"),
+                          helper,
                           QStringLiteral("service"),
                           QString::number(QCoreApplication::applicationPid()) });
 }

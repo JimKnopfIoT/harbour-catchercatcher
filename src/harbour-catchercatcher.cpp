@@ -18,6 +18,7 @@
 #include "ocidlookup.h"
 #include "bnetzalookup.h"
 #include "sensorreader.h"
+#include "mtkdiag.h"
 
 int main(int argc, char *argv[])
 {
@@ -53,6 +54,12 @@ int main(int argc, char *argv[])
     // Relative heading (gyro+accel, like iBT) so the map can rotate heading-up.
     QScopedPointer<SensorReader> sensor(new SensorReader(view.data()));
     view->rootContext()->setContextProperty(QStringLiteral("sensor"), sensor.data());
+
+    // Baseband platform probe: tells the UI whether this device speaks
+    // Qualcomm /dev/diag (Tier 2 works) or MediaTek CCCI/DHL (different node
+    // names, no collector yet). See src/mtkdiag.h.
+    QScopedPointer<MtkDiag> mtk(new MtkDiag(view.data()));
+    view->rootContext()->setContextProperty(QStringLiteral("mtk"), mtk.data());
 
     view->setSource(SailfishApp::pathTo("qml/harbour-catchercatcher.qml"));
     view->show();

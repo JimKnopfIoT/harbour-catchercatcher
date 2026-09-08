@@ -1,0 +1,579 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# harbour-catchercatcher-mtk-helper — Tier 2 for MediaTek, runs as root via pkexec.
+#
+# The MediaTek counterpart of harbour-catchercatcher-diag-helper. MediaTek has no
+# /dev/diag; the modem log is MediaTek's CCCI/DHL channel, owned by the vendor
+# daemon `emdlogger` and driven through the abstract unix socket
+# @com.mediatek.mdlogger.socket1 (ASCII commands: full_filter, deep_start,2,
+# deep_pause, get_run_folder, …). emdlogger writes MUZ-container log files
+# (MDLog1_<ts>_data.muxz) into its run folder; the L3 payload is NOT compressed.
+#
+# What this helper detects (verified against on-device 2G captures, 2026-09):
+#   * TP-PID 0x40  -> classic Type-0 "silent" SMS (network-side ping / catcher).
+#   * TP-UDHI application-port UDH (IEI 0x04/0x05, e.g. port 9200) -> silent
+#     data SMS ("SMS Ping"). Arrives unchanged on this network.
+# NOTE (2026-09-08): a consumer device CANNOT deliver a real Type-0 through the
+# operator SMSC — the network strips 0x40 -> 0x00 (empty). But a catcher / network
+# element with its own signalling can inject a genuine 0x40 toward the phone, so
+# the *receive-side* detector must keep flagging 0x40. The stripped variant
+# (PID=0x00, UDL=0, empty) is deliberately NOT flagged (would false-alarm on any
+# empty SMS). See docs / memory `type0-pid40-vom-netz-gestrippt`.
+#
+# Detection reuses the exact strongly-validated SMS-DELIVER parser from the
+# Qualcomm helper (MTI + TON/NPI whitelist + dialable-address + BCD-calendar SCTS
+# + UDL-fit). The DHL log interleaves framing bytes inside a record, but the
+# TPDU header fields (FO/OA/PID/DCS/SCTS/UDL) and the UDH at the start of the UD
+# are contiguous — exactly what the validator needs — so the silent kinds are
+# detectable without the (encoded, modem-embedded) MDDB decoder database.
+#
+# Emits the SAME NDJSON schema as the Qualcomm helper so CellMonitor consumes it
+# unchanged: {"ev":"ready"|"hb"|"bye"|"error"|"alarm", ...}. stdlib-only.
+
+import os
+import sys
+import time
+import glob
+import json
+import socket
+import struct
+
+MDLOG_SOCKET = "\0com.mediatek.mdlogger.socket1"   # abstract namespace (leading NUL)
+# Candidate run-folder roots emdlogger uses; the socket tells us the live one.
+RUN_GLOB = "*_data.mux*"
+
+
+def _emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+# --- emdlogger control socket ---------------------------------------------
+def _mdlog_cmd(cmd, timeout=5.0):
+    """Send one ASCII command to emdlogger, return its reply value string.
+    Reply is '<cmd>,<value>'; we return the value (or '' / None on failure)."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(MDLOG_SOCKET)
+        s.sendall(cmd.encode() + b"\0")
+        r = s.recv(512)
+        s.close()
+    except OSError:
+        return None
+    txt = r.decode("latin1", "replace").strip("\x00").strip()
+    if "," in txt:
+        return txt.split(",", 1)[1]
+    return txt
+
+
+def _newest_logfile(run_folder):
+    try:
+        fs = [f for f in glob.glob(os.path.join(run_folder, RUN_GLOB))
+              if os.path.isfile(f)]
+    except OSError:
+        return None
+    if not fs:
+        return None
+    return max(fs, key=lambda p: os.path.getmtime(p))
+
+
+def _total_bytes(run_folder):
+    f = _newest_logfile(run_folder)
+    try:
+        return os.path.getsize(f) if f else 0
+    except OSError:
+        return 0
+
+
+def mdlog_start():
+    """Arm emdlogger for full logging and return the run folder that is actually
+    being written to. Handles the stale-run-folder trap (get_run_folder can name
+    a directory from a previous boot that emdlogger no longer writes to): after a
+    deep_pause it reports the live folder; we mkdir it and verify growth, retrying
+    once. Returns the run-folder path, or None on failure."""
+    _mdlog_cmd("deep_pause")
+    _mdlog_cmd("default_filter")
+    if _mdlog_cmd("full_filter") is None:
+        return None
+    for attempt in range(2):
+        rf = _mdlog_cmd("get_run_folder")
+        if not rf:
+            return None
+        try:
+            os.makedirs(rf, exist_ok=True)
+        except OSError:
+            pass
+        base = _total_bytes(rf)
+        _mdlog_cmd("deep_start,2")
+        # Verify the newest log file actually grows within a few seconds.
+        for _ in range(6):
+            time.sleep(1.0)
+            if _total_bytes(rf) > base:
+                return rf
+        # Not growing -> stale folder; pause so the next get_run_folder rotates.
+        _mdlog_cmd("deep_pause")
+    return rf   # best effort; caller will still tail it
+
+
+def mdlog_stop():
+    """Leave the device as we found it: stop deep logging, restore the default
+    filter. Best-effort; never raises."""
+    _mdlog_cmd("deep_pause")
+    _mdlog_cmd("default_filter")
+
+
+# --- tailing the growing MUZ log ------------------------------------------
+class DhlTail:
+    """Yield newly-appended bytes from emdlogger's current log file, following
+    rotation to a newer file. Keeps a small carry so a TPDU split across a read
+    boundary is still seen (dedup makes the re-scan overlap harmless)."""
+    CARRY = 256
+
+    def __init__(self, run_folder):
+        self.run = run_folder
+        self.path = _newest_logfile(run_folder)
+        self.pos = 0
+        self.carry = b""
+
+    def read(self):
+        newest = _newest_logfile(self.run)
+        if newest and newest != self.path:
+            self.path = newest          # rotated to a new file
+            self.pos = 0
+            self.carry = b""
+        if not self.path:
+            self.path = newest
+            return b""
+        try:
+            sz = os.path.getsize(self.path)
+            if sz < self.pos:           # truncated/rotated in place
+                self.pos = 0
+                self.carry = b""
+            if sz <= self.pos:
+                return b""
+            with open(self.path, "rb") as fh:
+                fh.seek(self.pos)
+                chunk = fh.read(sz - self.pos)
+        except OSError:
+            return b""
+        self.pos += len(chunk)
+        out = self.carry + chunk
+        self.carry = out[-self.CARRY:]
+        return out
+def _decode_addr(b, off, oal):
+    """Decode a GSM TP-address (semi-octet BCD, swapped) into a *dialable* number
+    string, or None if it isn't one. Real MSISDNs use only digits 0-9 plus a single
+    trailing 0xF filler on an odd length. Rejecting a-f in significant positions is
+    what kills the false positives (e.g. call-control DTAP bytes decoding to '+a3…'
+    or '+cb' during a voice call) — those are never valid sender numbers."""
+    noct = (oal + 1) // 2
+    digits = []
+    for x in b[off:off + noct]:
+        digits.append(x & 0x0F)
+        digits.append(x >> 4)
+    if oal % 2 == 1:                      # odd length -> last nibble must be filler
+        if digits[-1] != 0x0F:
+            return None
+        digits = digits[:-1]
+    if len(digits) != oal:
+        return None
+    s = ""
+    for d in digits:
+        if d > 9:                         # only 0-9; no *,#,a-f garbage
+            return None
+        s += str(d)
+    return s
+
+
+def _parse_deliver(b, i):
+    """Parse a strongly-validated SMS-DELIVER TPDU at b[i:] -> (tpdu, fields) or None.
+    MTI + type-of-address whitelist + dialable-address + BCD-*calendar* timestamp +
+    UDL-fit checks make a false match at a random offset (e.g. inside call-control
+    signalling) practically impossible."""
+    n = len(b)
+    if i + 13 > n:
+        return None
+    fo = b[i]
+    if (fo & 0x03) != 0x00:               # MTI must be 00 = SMS-DELIVER
+        return None
+    oal = b[i + 1]
+    if oal < 6 or oal > 20:               # plausible MSISDN length (>= 6 digits)
+        return None
+    toa = b[i + 2]                        # TP-OA type-of-address octet
+    ton = (toa >> 4) & 0x07
+    npi = toa & 0x0F
+    if not (toa & 0x80):                  # bit7 always set
+        return None
+    if ton not in (0, 1, 2):             # unknown / international / national only
+        return None
+    if npi not in (0, 1):                # unknown / ISDN-E.164 only
+        return None
+    noct = (oal + 1) // 2
+    oa = _decode_addr(b, i + 3, oal)
+    if oa is None:
+        return None
+    k = i + 3 + noct
+    if k + 10 > n:
+        return None
+    pid, dcs = b[k], b[k + 1]
+    scts = b[k + 2:k + 9]                 # TP-SCTS: 7 BCD octets (swapped nibbles)
+    for x in scts:
+        if (x & 0x0F) > 9 or (x >> 4) > 9:
+            return None
+    def _bcd(x):
+        return (x & 0x0F) * 10 + (x >> 4)
+    mon, day = _bcd(scts[1]), _bcd(scts[2])
+    hh, mm, ss = _bcd(scts[3]), _bcd(scts[4]), _bcd(scts[5])
+    if not (1 <= mon <= 12 and 1 <= day <= 31 and hh <= 23 and mm <= 59 and ss <= 59):
+        return None                      # must be a real calendar date/time
+    udl = b[k + 9]
+    ud_start = k + 10
+    alpha = (dcs >> 2) & 0x03 if (dcs & 0xC0) == 0 else 1   # 0=7bit else octets
+    ud_oct = (udl * 7 + 7) // 8 if alpha == 0 else udl
+    if ud_oct > 160 or ud_start + ud_oct > n:
+        return None
+    fields = {"fo": fo, "oa": oa,
+              "pid": pid, "dcs": dcs, "udl": udl, "ud": b[ud_start:ud_start + ud_oct]}
+    return b[i:ud_start + ud_oct], fields
+
+
+def _silent_kind(f):
+    """('Type-0'|'Port-Daten-SMS', extra) if the DELIVER is silent/stealth, else None."""
+    if f["pid"] == 0x40:                  # Short Message Type 0
+        return "Type-0", ""
+    if (f["fo"] & 0x40) and f["ud"]:      # TP-UDHI -> walk the UDH
+        ud = f["ud"]
+        udh = ud[1:1 + ud[0]]
+        j = 0
+        while j + 1 < len(udh):
+            iei, iedl = udh[j], udh[j + 1]
+            val = udh[j + 2:j + 2 + iedl]
+            if iei in (0x04, 0x05):       # application-port addressing (silent data SMS)
+                port = int.from_bytes(val[:2], "big") if iei == 0x05 else (val[0] if val else 0)
+                return "Port-Daten-SMS", " (Port %d)" % port
+            j += 2 + iedl
+    return None
+
+
+
+
+# --- SMS-DELIVER detection -------------------------------------------------
+# The parser below (_decode_addr / _parse_deliver / _silent_kind) is byte-for-byte
+# the Qualcomm helper's validator, so both platforms flag identical silent kinds.
+_sms_seen = {}     # tpdu-hex -> last emit time (dedup: one SMS logs many times)
+
+
+def _valid_scts(b, s):
+    """True if b[s:s+7] is a TP-SCTS: 7 BCD octets (swapped nibbles) forming a
+    real calendar date/time. This is the framing-robust anchor — the DHL log may
+    interleave bytes inside a record, but PID/DCS/SCTS/UDL and the UDH at the UD
+    start stay contiguous, and a valid 7-byte calendar stamp is rare by chance."""
+    if s < 2 or s + 8 > len(b):
+        return False
+    sc = b[s:s + 7]
+    for x in sc:
+        if (x & 0x0F) > 9 or (x >> 4) > 9:
+            return False
+    def bcd(x):
+        return (x & 0x0F) * 10 + (x >> 4)
+    mon, day = bcd(sc[1]), bcd(sc[2])
+    hh, mm, ss = bcd(sc[3]), bcd(sc[4]), bcd(sc[5])
+    return 1 <= mon <= 12 and 1 <= day <= 31 and hh <= 23 and mm <= 59 and ss <= 59
+
+
+def _port_from_udh(ud):
+    """If the user data starts with a UDH carrying an application-port IE
+    (IEI 0x04 = 8-bit ports, 0x05 = 16-bit ports), return the destination port,
+    else None."""
+    if not ud:
+        return None
+    udhl = ud[0]
+    if udhl == 0 or 1 + udhl > len(ud):
+        return None
+    udh = ud[1:1 + udhl]
+    j = 0
+    while j + 1 < len(udh):
+        iei, iedl = udh[j], udh[j + 1]
+        val = udh[j + 2:j + 2 + iedl]
+        if iei == 0x05 and len(val) >= 2:          # 16-bit application ports
+            return int.from_bytes(val[:2], "big")
+        if iei == 0x04 and len(val) >= 1:          # 8-bit application ports
+            return val[0]
+        j += 2 + iedl
+    return None
+
+
+def _recover_oa(b, s):
+    """Best-effort: recover the originator MSISDN of the DELIVER whose SCTS starts
+    at b[s], by locating a valid TP-OA (len + type-of-address + BCD digits) just
+    before the PID/DCS pair. Returns a dialable string or None if the header was
+    framing-corrupted (then the alarm still fires, just without a number)."""
+    for oalen in range(6, 21):
+        noct = (oalen + 1) // 2
+        oa_start = s - 2 - 1 - 1 - noct            # digits, toa, len, before PID/DCS
+        if oa_start < 1:
+            continue
+        L = b[oa_start]
+        toa = b[oa_start + 1]
+        if L != oalen or not (toa & 0x80):
+            continue
+        ton = (toa >> 4) & 0x07
+        if ton not in (0, 1, 2) or (toa & 0x0F) not in (0, 1):
+            continue
+        num = _decode_addr(b, oa_start + 2, oalen)
+        if num:
+            return num
+    return None
+
+
+def _mk_alarm(now, label, extra, l3, oa):
+    frm = ("+" + oa) if oa else "unbekannt"
+    return {"ev": "alarm", "kind": "silent-sms",
+            "type": "Unsichtbare SMS (%s)%s" % (label, extra),
+            "severity": 2, "from": frm,
+            "dcs": "still (keine Anzeige)",
+            "text": "Unsichtbare SMS empfangen (stiller Ping, %s) von %s — "
+                    "mögliche Ortung/Erreichbarkeitsprüfung." % (label, frm),
+            "l3": l3.hex()}
+
+
+def _dedup(key, now):
+    """True if this exact record was already emitted within 30 s (copies of one
+    SMS repeat across CP/RP layers and retransmits)."""
+    if now - _sms_seen.get(key, 0) < 30:
+        return True
+    _sms_seen[key] = now
+    if len(_sms_seen) > 256:
+        for kk in [k for k, t in _sms_seen.items() if now - t > 60]:
+            _sms_seen.pop(kk, None)
+    return False
+
+
+def _scan_and_alarm(buf):
+    """Find silent SMS-DELIVERs in a raw DHL byte buffer and return alarm dicts.
+    Both detectors anchor on an exact, rare signature and cross-check a valid
+    TP-SCTS (calendar) — and, for Type-0, a recoverable dialable originator — so
+    they survive the DHL record framing yet almost never false-fire.
+
+      Port-data silent SMS ("SMS Ping"): the UD begins with a lone application-
+        port UDH — 16-bit '06 05 04 dd dd oo oo' or 8-bit '04 04 02 dd oo' — with
+        an 8-bit DCS and a valid SCTS just before the UDL. Arrives unchanged.
+      Type-0 (classic silent SMS, injectable by a catcher/network element):
+        PID=0x40, DCS=0x00, empty body, valid SCTS, dialable originator.
+        (A consumer-sent Type-0 is stripped to PID=0x00/empty by the SMSC and is
+        deliberately NOT flagged; the threat is a genuine network-side 0x40.)"""
+    out = []
+    now = time.time()
+    n = len(buf)
+
+    # (1) Port-addressed silent data SMS — exact UDH signature + SCTS cross-check.
+    for sig in (b"\x06\x05\x04", b"\x04\x04\x02"):
+        udhl = sig[0]
+        start = 0
+        while True:
+            u = buf.find(sig, start)
+            if u < 0:
+                break
+            start = u + 1
+            s = u - 8                      # UDL at u-1, SCTS at u-8..u-2
+            if s < 2 or u + 1 + udhl > n:
+                continue
+            if not _valid_scts(buf, s):
+                continue
+            dcs = buf[s - 1]
+            if (dcs & 0x0C) != 0x04:       # 8-bit data coding
+                continue
+            udl = buf[u - 1]
+            if udl < udhl + 1:
+                continue
+            port = _port_from_udh(buf[u:u + 1 + udhl])
+            if port is None:
+                continue
+            pid = buf[s - 2]
+            l3 = buf[s - 2:u + 1 + udhl]
+            # dedup per send: SCTS is unique per SMS; CP/RP copies share it
+            if _dedup("P" + buf[s:s + 7].hex() + str(port), now):
+                continue
+            oa = _recover_oa(buf, s)
+            out.append(_mk_alarm(now, "Port-Daten-SMS", " (Port %d)" % port, l3, oa))
+
+    # (2) Type-0 — PID=0x40, DCS=0, empty, valid SCTS, recoverable originator.
+    start = 0
+    while True:
+        p = buf.find(b"\x40\x00", start)
+        if p < 0:
+            break
+        start = p + 1
+        s = p + 2                          # SCTS begins right after PID,DCS
+        if s + 8 > n:
+            continue
+        if not _valid_scts(buf, s):
+            continue
+        if buf[s + 7] != 0x00:             # UDL must be 0 (classic empty Type-0)
+            continue
+        oa = _recover_oa(buf, s)
+        if not oa:                         # require a real dialable sender -> no FP
+            continue
+        l3 = buf[p:s + 8]
+        if _dedup("T" + buf[s:s + 7].hex() + oa, now):
+            continue
+        out.append(_mk_alarm(now, "Type-0", "", l3, oa))
+    return out
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# --- service mode (what CellMonitor launches) ------------------------------
+def cmd_service(watch_pid=None):
+    if not os.path.exists("/dev/ccci_ccb_dhl"):
+        _emit({"ev": "error", "msg": "kein DHL-Kanal (/dev/ccci_ccb_dhl) — kein MediaTek?"})
+        return 1
+    run = mdlog_start()
+    if not run:
+        _emit({"ev": "error", "msg": "emdlogger-Steuersocket antwortet nicht"})
+        return 1
+    tail = DhlTail(run)
+
+    # Same stop protocol as the Qualcomm helper: the app (defaultuser) can't
+    # signal this root process, so it drops a sentinel file we poll.
+    stop_path = ("/tmp/harbour-catchercatcher-diag-stop.%d" % watch_pid
+                 if watch_pid is not None else None)
+
+    _emit({"ev": "ready"})
+    ppid0 = os.getppid()
+    last_hb = time.time()
+    rc = 0
+    try:
+        while True:
+            if stop_path and os.path.lexists(stop_path):
+                is_link = os.path.islink(stop_path)
+                try:
+                    os.unlink(stop_path)
+                except OSError:
+                    pass
+                if not is_link:
+                    break
+            if watch_pid is not None and not _pid_alive(watch_pid):
+                break
+            if os.getppid() != ppid0:
+                break
+            now = time.time()
+            if now - last_hb >= 4:
+                last_hb = now
+                try:
+                    _emit({"ev": "hb"})
+                except (BrokenPipeError, OSError):
+                    break
+            buf = tail.read()
+            if buf:
+                for a in _scan_and_alarm(buf):
+                    _emit(a)
+            time.sleep(0.5)
+    finally:
+        mdlog_stop()
+    try:
+        _emit({"ev": "bye"})
+    except (BrokenPipeError, OSError):
+        pass
+    return rc
+
+
+# --- manual test modes -----------------------------------------------------
+def cmd_smshunt(seconds, outpath="/tmp/ccmtk.txt"):
+    """Capture for N seconds and print every silent SMS found (human-readable)."""
+    run = mdlog_start()
+    if not run:
+        sys.stdout.write("[X] emdlogger-Steuersocket antwortet nicht\n")
+        return 1
+    sys.stdout.write("[*] run-folder %s — %ds lauschen; JETZT stille SMS senden\n"
+                     % (run, seconds))
+    sys.stdout.flush()
+    tail = DhlTail(run)
+    hits = 0
+    try:
+        deadline = time.time() + seconds
+        with open(outpath, "w") as out:
+            while time.time() < deadline:
+                buf = tail.read()
+                if buf:
+                    for a in _scan_and_alarm(buf):
+                        hits += 1
+                        line = "[!] %s von %s  l3=%s" % (a["type"], a["from"], a["l3"])
+                        sys.stdout.write(line + "\n"); sys.stdout.flush()
+                        out.write(line + "\n")
+                time.sleep(0.5)
+    finally:
+        mdlog_stop()
+    sys.stdout.write("[=] %d stille SMS erkannt -> %s\n" % (hits, outpath))
+    return 0
+
+
+def cmd_logtest(seconds):
+    """Sanity check: arm logging, report how many bytes flow and whether any
+    valid SMS-DELIVER (silent or not) is seen — no modem disturbance."""
+    run = mdlog_start()
+    if not run:
+        sys.stdout.write("[X] emdlogger-Steuersocket antwortet nicht\n")
+        return 1
+    sys.stdout.write("[*] run-folder %s — %ds messen\n" % (run, seconds))
+    sys.stdout.flush()
+    tail = DhlTail(run)
+    total = 0
+    try:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            buf = tail.read()
+            total += len(buf)
+            if buf:
+                for a in _scan_and_alarm(buf):
+                    sys.stdout.write("[!] %s von %s\n" % (a["type"], a["from"]))
+                    sys.stdout.flush()
+            time.sleep(0.5)
+    finally:
+        mdlog_stop()
+    sys.stdout.write("[=] %d Bytes DHL-Log gelesen\n" % total)
+    return 0
+
+
+def cmd_scanfile(path):
+    """Offline: scan a captured MUZ/muxz file and print detected silent SMS.
+    Used to verify the detector against known reference captures."""
+    with open(path, "rb") as fh:
+        buf = fh.read()
+    n = 0
+    for a in _scan_and_alarm(buf):
+        n += 1
+        sys.stdout.write("[!] %s von %s  l3=%s\n" % (a["type"], a["from"], a["l3"]))
+    sys.stdout.write("[=] %d stille SMS in %s (%d Bytes)\n" % (n, path, len(buf)))
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "service":
+        wp = int(argv[2]) if len(argv) >= 3 and argv[2].isdigit() else None
+        return cmd_service(wp)
+    if len(argv) >= 3 and argv[1] == "smshunt":
+        return cmd_smshunt(int(argv[2]), argv[3] if len(argv) > 3 else "/tmp/ccmtk.txt")
+    if len(argv) >= 3 and argv[1] == "logtest":
+        return cmd_logtest(int(argv[2]))
+    if len(argv) >= 3 and argv[1] == "scanfile":
+        return cmd_scanfile(argv[2])
+    sys.stderr.write("usage: harbour-catchercatcher-mtk-helper service [WATCH_PID]\n"
+                     "       harbour-catchercatcher-mtk-helper smshunt SECONDS [OUT]\n"
+                     "       harbour-catchercatcher-mtk-helper logtest SECONDS\n"
+                     "       harbour-catchercatcher-mtk-helper scanfile PATH\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
