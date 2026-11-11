@@ -119,7 +119,7 @@ Catcher Catcher is a **passive, defensive** tool — it only observes your own
 device and reads your own baseband diagnostics; it never transmits, jams, attacks
 or interferes with any network. How you use it is your responsibility.
 
-AI assisted development
+LLM assisted development
 
 ## License
 
