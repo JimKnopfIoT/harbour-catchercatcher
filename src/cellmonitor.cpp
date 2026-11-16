@@ -58,6 +58,23 @@ static int mapInt(const QVariantMap &m, const QString &key, int fallback = -1)
     return unwrap(m.value(key)).toInt();
 }
 
+// LTE RSRP/RSRQ -> dBm / dB (0 = unknown). Sailfish's ofono does NOT deliver the
+// documented 3GPP indices: plugins/cellinfo-netmon.c passes the Android RIL values
+// through unconverted (RSRP as -dBm 44..140, RSRQ as -dB 3..20) AND swaps the two
+// D-Bus keys. So sort the raw values by range instead of trusting the key names —
+// that stays correct should ofono ever fix the swap.
+static void lteSignal(int a, int b, int *rsrpDbm, int *rsrqDb)
+{
+    *rsrpDbm = 0;
+    *rsrqDb = 0;
+    for (int v : { a, b }) {
+        if (v >= 44 && v <= 140)
+            *rsrpDbm = -v;
+        else if (v >= 1 && v <= 34)
+            *rsrqDb = -v;
+    }
+}
+
 CellMonitor::CellMonitor(QObject *parent)
     : QObject(parent)
 {
@@ -215,13 +232,6 @@ void CellMonitor::poll()
     if (!m_available) { m_available = true; emit availableChanged(); }
     const QVariantMap reg = regReply.value();
 
-    QDBusInterface netMon(OFONO, m_modemPath,
-                          QStringLiteral("org.ofono.NetworkMonitor"), bus);
-    netMon.setTimeout(kFastTimeoutMs);
-    QDBusReply<QVariantMap> servReply =
-            netMon.call(QStringLiteral("GetServingCellInformation"));
-    const QVariantMap serv = servReply.isValid() ? servReply.value() : QVariantMap();
-
     int neighbours = -1;
     QDBusInterface cellInfo(OFONO, m_modemPath,
                             QStringLiteral("org.nemomobile.ofono.CellInfo"), bus);
@@ -230,6 +240,45 @@ void CellMonitor::poll()
             cellInfo.call(QStringLiteral("GetCells"));
     if (cellsReply.isValid())
         neighbours = cellsReply.value().size();
+
+    // Serving cell: prefer the registered cell of nemo's CellInfo (answers in
+    // ~15 ms, carries the raw cell values under their own names). NetworkMonitor
+    // is only the fallback: GetServingCellInformation waits up to ~10 s for a
+    // cell-info update, and once our short timeout has given up, ofono keeps the
+    // request pending — every following poll then gets "InProgress" and the
+    // serving-cell fields stay empty for good (seen on the J2 with NR preferred).
+    QVariantMap cell;
+    if (cellsReply.isValid()) {
+        QList<QDBusObjectPath> paths = cellsReply.value();
+        for (int i = 0; i < paths.size(); ++i) {   // last registered cell first
+            if (paths.at(i).path() == m_servingCellPath) { paths.move(i, 0); break; }
+        }
+        for (const QDBusObjectPath &p : paths) {
+            QDBusInterface c(OFONO, p.path(), QStringLiteral("org.nemomobile.ofono.Cell"), bus);
+            c.setTimeout(kFastTimeoutMs);
+            QDBusReply<bool> regd = c.call(QStringLiteral("GetRegistered"));
+            if (!regd.isValid() || !regd.value())
+                continue;
+            QDBusReply<QVariantMap> props = c.call(QStringLiteral("GetProperties"));
+            if (props.isValid()) {
+                cell = props.value();
+                m_servingCellPath = p.path();
+            }
+            --neighbours;   // GetCells lists the serving cell too
+            break;
+        }
+    }
+
+    QVariantMap serv;
+    if (cell.isEmpty()) {
+        QDBusInterface netMon(OFONO, m_modemPath,
+                              QStringLiteral("org.ofono.NetworkMonitor"), bus);
+        netMon.setTimeout(kFastTimeoutMs);
+        QDBusReply<QVariantMap> servReply =
+                netMon.call(QStringLiteral("GetServingCellInformation"));
+        if (servReply.isValid())
+            serv = servReply.value();
+    }
 
     QDBusInterface radio(OFONO, m_modemPath,
                          QStringLiteral("org.ofono.RadioSettings"), bus);
@@ -258,10 +307,20 @@ void CellMonitor::poll()
                      mapInt(reg, QStringLiteral("LocationAreaCode"), -1));
     if (lac < 0)
         lac = mapInt(serv, QStringLiteral("TrackingAreaCode"), -1);
-    const int earfcn = mapInt(serv, QStringLiteral("EARFCN"),
-                              mapInt(serv, QStringLiteral("ARFCN"), -1));
-    const int rsrp = mapInt(serv, QStringLiteral("ReferenceSignalReceivedPower"), -1);
-    const int rsrq = mapInt(serv, QStringLiteral("ReferenceSignalReceivedQuality"), -1);
+    if (lac < 0)
+        lac = mapInt(cell, QStringLiteral("tac"), mapInt(cell, QStringLiteral("lac"), -1));
+    int earfcn = mapInt(serv, QStringLiteral("EARFCN"),
+                        mapInt(serv, QStringLiteral("ARFCN"), -1));
+    if (earfcn < 0)
+        earfcn = mapInt(cell, QStringLiteral("earfcn"), mapInt(cell, QStringLiteral("arfcn"), -1));
+    int rsrp, rsrq;
+    if (!cell.isEmpty())
+        lteSignal(mapInt(cell, QStringLiteral("rsrp")), mapInt(cell, QStringLiteral("rsrq")),
+                  &rsrp, &rsrq);
+    else
+        lteSignal(mapInt(serv, QStringLiteral("ReferenceSignalReceivedPower"), -1),
+                  mapInt(serv, QStringLiteral("ReferenceSignalReceivedQuality"), -1),
+                  &rsrp, &rsrq);
     const int strength = mapInt(serv, QStringLiteral("Strength"),
                                 mapInt(reg, QStringLiteral("Strength"), -1));
 
@@ -293,8 +352,8 @@ void CellMonitor::poll()
     // Is the *current* signal strong? A real catcher pulls you down with a
     // strong local signal; a benign coverage-driven downgrade (basement, cell
     // edge) happens when the signal is weak. We only alarm on strong signals.
-    const bool strongSignal = (m_rsrp != -1 && m_rsrp >= -100) ||
-                              (m_rsrp == -1 && m_strength >= 40);
+    const bool strongSignal = (m_rsrp != 0 && m_rsrp >= -100) ||
+                              (m_rsrp == 0 && m_strength >= 40);
 
     if (m_havePrev && cid != 0 && !trusted) {
         const int prevRank = techRank(m_prevTech);
@@ -356,8 +415,8 @@ void CellMonitor::poll()
     if (m_bnetza && cid != 0 && cid != m_ghostCheckedCell && !trusted &&
         m_gpsValid && m_lat != 0.0 && m_lon != 0.0 &&
         m_bnetza->areaLoaded(m_lat, m_lon)) {
-        const bool strong = (m_rsrp != -1 && m_rsrp >= -85) ||
-                            (m_rsrp == -1 && m_strength >= 70);
+        const bool strong = (m_rsrp != 0 && m_rsrp >= -85) ||
+                            (m_rsrp == 0 && m_strength >= 70);
         bool ghost = false;
         if (strong) {
             const double d = m_bnetza->nearestSiteMeters(m_lat, m_lon);
@@ -724,8 +783,8 @@ void CellMonitor::addSample()
         m_samples.clear();
     }
 
-    // signal metric: prefer RSRP (0..97 in ofono units), else strength %.
-    const int sig = m_rsrp >= 0 ? m_rsrp : m_strength;
+    // signal metric: prefer RSRP (shifted to 0..96, higher = stronger), else strength %.
+    const int sig = m_rsrp != 0 ? m_rsrp + 140 : m_strength;
 
     // de-dupe near-identical fixes to avoid piling up while standing still
     if (!m_samples.isEmpty()) {

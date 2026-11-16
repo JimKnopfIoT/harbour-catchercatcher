@@ -130,8 +130,8 @@ Page {
                 CellField { width: cellGrid.cellW; label: qsTr("LAC / TAC");  value: monitor.lac >= 0 ? String(monitor.lac) : "–" }
                 CellField { width: cellGrid.cellW; label: qsTr("EARFCN");     value: monitor.earfcn >= 0 ? String(monitor.earfcn) : "–" }
                 CellField { width: cellGrid.cellW; label: qsTr("Signal");     value: monitor.strength >= 0 ? monitor.strength + " %" : "–" }
-                CellField { width: cellGrid.cellW; label: qsTr("RSRP");       value: monitor.rsrp >= 0 ? String(monitor.rsrp) : "–" }
-                CellField { width: cellGrid.cellW; label: qsTr("RSRQ");       value: monitor.rsrq >= 0 ? String(monitor.rsrq) : "–" }
+                CellField { width: cellGrid.cellW; label: qsTr("RSRP");       value: monitor.rsrp !== 0 ? monitor.rsrp + " dBm" : "–" }
+                CellField { width: cellGrid.cellW; label: qsTr("RSRQ");       value: monitor.rsrq !== 0 ? monitor.rsrq + " dB" : "–" }
                 CellField { width: cellGrid.cellW; label: qsTr("Nachbarzellen"); value: monitor.neighbourCount >= 0 ? String(monitor.neighbourCount) : "–" }
                 CellField { width: cellGrid.cellW; label: qsTr("Präferenz");  value: monitor.technologyPreference ? monitor.technologyPreference.toUpperCase() : "–" }
             }

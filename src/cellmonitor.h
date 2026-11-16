@@ -279,8 +279,9 @@ private:
     uint m_cellId = 0;
     int m_lac = -1;
     int m_earfcn = -1;
-    int m_rsrp = -1;
-    int m_rsrq = -1;
+    QString m_servingCellPath;   // nemo CellInfo path of the last registered cell
+    int m_rsrp = 0;              // dBm, 0 = unknown
+    int m_rsrq = 0;              // dB, 0 = unknown
     int m_strength = -1;
     int m_neighbourCount = -1;
 

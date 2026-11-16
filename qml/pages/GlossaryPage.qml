@@ -11,9 +11,6 @@ Page {
     property CellMonitor monitor
     allowedOrientations: Orientation.All
 
-    // ofono reports RSRP/RSRQ as 3GPP indices, not dBm. Convert for the reader.
-    function rsrpDbm(idx) { return idx >= 0 ? (idx - 140) : NaN }      // 0..97 → -140..-44 dBm
-    function rsrqDb(idx)  { return idx >= 0 ? (idx / 2 - 19.5) : NaN } // 0..34 → -19.5..-2.5 dB
 
     SilicaFlickable {
         anchors.fill: parent
@@ -60,9 +57,8 @@ Page {
 
             SectionHeader { text: qsTr("Signalstärke") }
             DetailBlock {
-                term: qsTr("RSRP" + (monitor.rsrp >= 0 ? "  (≈ " + page.rsrpDbm(monitor.rsrp).toFixed(0) + " dBm)" : ""))
-                body: qsTr("Empfangsleistung des Referenzsignals. Angezeigt als 3GPP-Index " +
-                    "(0…97); als Leistung ≈ Index − 140 dBm. Faustregel:\n" +
+                term: qsTr("RSRP" + (monitor.rsrp !== 0 ? "  (" + monitor.rsrp + " dBm)" : ""))
+                body: qsTr("Empfangsleistung des Referenzsignals in dBm (−140 … −44). Faustregel:\n" +
                     "• > −80 dBm: ausgezeichnet\n" +
                     "• −80 … −95: gut\n" +
                     "• −95 … −110: mäßig\n" +
@@ -71,8 +67,8 @@ Page {
                     "ist ein Warnzeichen (Catcher stehen oft nah und senden laut).")
             }
             DetailBlock {
-                term: qsTr("RSRQ" + (monitor.rsrq >= 0 ? "  (≈ " + page.rsrqDb(monitor.rsrq).toFixed(1) + " dB)" : ""))
-                body: qsTr("Empfangsqualität. Index 0…34; als Verhältnis ≈ Index/2 − 19,5 dB. " +
+                term: qsTr("RSRQ" + (monitor.rsrq !== 0 ? "  (" + monitor.rsrq + " dB)" : ""))
+                body: qsTr("Empfangsqualität in dB (−20 … −3, immer negativ). " +
                     "> −10 dB gut, −10…−15 mäßig, < −15 schlecht.")
             }
             DetailBlock {

@@ -1,7 +1,7 @@
 Name:       harbour-catchercatcher
 Summary:    Detect IMSI-catcher fingerprints from cell + baseband signals
-Version:    0.1.2
-Release:    1
+Version:    0.1.3
+Release:    3
 %define _buildhost reproducible-builder
 Group:      Qt/Qt
 License:    GPLv3+
@@ -61,6 +61,17 @@ desktop-file-install --delete-original \
 %{_datadir}/polkit-1/actions/catchercatcher.policy
 
 %changelog
+* Mon Nov 16 2026 harbour-catchercatcher contributors 0.1.3-3
+- Fix LTE RSRP/RSRQ (issue #1): Sailfish's ofono swaps the two NetworkMonitor
+  keys and passes the RIL values through as -dBm / -dB instead of 3GPP indices.
+  The app now sorts them by value range and shows real dBm / dB. This also
+  repairs the "strong signal" gate of the downgrade and ghost-site heuristics,
+  which compared the raw values against dBm thresholds and was always true.
+- Serving-cell data (EARFCN, TAC, RSRP, RSRQ) now comes from the registered cell
+  of nemo's CellInfo. ofono's GetServingCellInformation can stall for ~10 s and
+  then answers every later call with "InProgress", which left these fields empty.
+- The neighbour count no longer includes the serving cell itself.
+
 * Tue Sep 08 2026 harbour-catchercatcher contributors 0.1.2-1
 - Experimental MediaTek (MT6858) Tier 2: a DHL collector
   (harbour-catchercatcher-mtk-helper) drives emdlogger, tails the modem log and
